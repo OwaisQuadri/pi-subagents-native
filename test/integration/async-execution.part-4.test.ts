@@ -584,8 +584,8 @@ setTimeout(() => process.exit(90), 15000).unref();
 				structuredOutputCapture: { ok: true },
 				jsonl: [
 					{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-					{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 					{ type: "tool_execution_end", toolName: "structured_output" },
+					{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
 					terminalMessage,
 				],
 			});
@@ -621,8 +621,8 @@ setTimeout(() => process.exit(90), 15000).unref();
 			mockPi.onCall(capture === "invalid" ? {
 				jsonl: [
 					{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: "invalid" } } },
-					{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
 					{ type: "tool_execution_end", toolName: "structured_output", isError: true },
+					{ type: "message_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output validation failed." }], isError: true } },
 					events.assistantMessage("done"),
 				],
 			} : { output: "done" });
@@ -1618,6 +1618,60 @@ setTimeout(() => process.exit(90), 15000).unref();
 		assert.ok(statusDuringEvent, "expected status.json to expose needs_attention while the run is still active");
 		assert.equal(statusDuringEvent.activityState, "needs_attention");
 		assert.equal(statusDuringEvent.steps?.[0]?.activityState, "needs_attention");
+
+		const doneDeadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > doneDeadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	});
+
+	it("background status shows a tool-budget block from Pi's tool result message while the run is active", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const blockedMessage = "Tool budget hard limit reached after 2 tool calls (hard 1). The 'bash' tool is blocked so you can finalize from the context you already have.";
+		const blockedResult = { role: "toolResult", toolCallId: "bash-2", toolName: "bash", isError: true, content: [{ type: "text", text: blockedMessage }] };
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("bash", { command: "echo 1" }), events.toolEnd("bash"), events.toolResult("bash", "1")] },
+				// Pi's sequence for a call blocked by a tool_call handler: start, end with isError, then the toolResult message.
+				{ jsonl: [
+					{ type: "tool_execution_start", toolCallId: "bash-2", toolName: "bash", args: { command: "echo 2" } },
+					{ type: "tool_execution_end", toolCallId: "bash-2", toolName: "bash", isError: true },
+					{ type: "message_start", message: blockedResult },
+					{ type: "message_end", message: blockedResult },
+				] },
+				{ delay: 2_000, jsonl: [events.assistantMessage("Finalizing from what I have.")] },
+			],
+		});
+
+		const id = `async-tool-budget-blocked-${Date.now().toString(36)}`;
+		const statusPath = path.join(ASYNC_DIR, id, "status.json");
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Run echo three times",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			toolBudget: { hard: 1, block: "*" },
+		});
+
+		const deadline = Date.now() + 10_000;
+		let blockedStep: AsyncStatusPayload["steps"][number] | undefined;
+		while (Date.now() < deadline && !fs.existsSync(resultPath)) {
+			if (fs.existsSync(statusPath)) {
+				const step = (JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload).steps?.[0];
+				if (step?.status === "running" && step.toolBudgetBlocked) {
+					blockedStep = step;
+					break;
+				}
+			}
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.ok(blockedStep, "expected status.json to show the tool-budget block while the run is still active");
+		assert.equal(blockedStep.toolBudget?.blockedTool, "bash");
 
 		const doneDeadline = Date.now() + 10_000;
 		while (!fs.existsSync(resultPath)) {

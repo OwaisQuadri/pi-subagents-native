@@ -1138,63 +1138,47 @@ async function runSingleAttempt(
 						applyChildLifecycle(projectChildLifecycle(evt, true, childLifecycleState));
 					}
 				}
-				updateActivityState(now);
-				fireUpdate();
-			}
-
-			if (evt.type === "tool_result_end" && evt.message) {
-				const toolResultCompletion = {
-					toolCallId: (evt.message as { toolCallId?: unknown }).toolCallId ?? (evt as { toolCallId?: unknown }).toolCallId,
-					toolName: (evt.message as { toolName?: unknown }).toolName ?? (evt as { toolName?: unknown }).toolName,
-				};
-				clearActiveToolTimeout(toolResultCompletion);
-				const endedTool = removeActiveToolCall(toolResultCompletion);
-				if (endedTool) {
-					progress.recentTools.push({
-						tool: endedTool.tool,
-						args: endedTool.args,
-						endMs: now,
-					});
-					refreshCurrentTool();
-				}
-				result.messages!.push(evt.message);
-				const resultText = extractTextFromContent(evt.message.content);
-				// The result event's own tool name is authoritative; the single pending slot can
-				// describe a different, overlapping call and serves only as a fallback.
-				const blockedTool = (typeof toolResultCompletion.toolName === "string" && toolResultCompletion.toolName.length > 0
-					? toolResultCompletion.toolName
-					: undefined) ?? pendingToolResult?.tool;
-				if (options.toolBudget && isToolBudgetBlockedMessage(options.toolBudget, resultText, blockedTool)) {
-					result.toolBudgetBlocked = true;
-					result.toolBudget = toolBudgetState(
-						options.toolBudget,
-						Math.max(progress.toolCount, options.toolBudget.hard + 1),
-						blockedTool,
-					);
-				}
-				appendRecentOutput(progress, resultText.split("\n").slice(-10));
-				const toolSnapshot = pendingToolResult;
-				pendingToolResult = undefined;
-				if (toolSnapshot?.mutates && didMutatingToolFail(resultText)) {
-					recordMutatingFailure(mutatingFailures, {
-						tool: toolSnapshot.tool,
-						path: toolSnapshot.path,
-						error: resultText.split("\n").find((line) => line.trim())?.trim().slice(0, 180) ?? "mutating tool failed",
-						ts: now,
-					}, mutatingFailureWindowMs);
-					if (shouldEscalateMutatingFailures(mutatingFailures, controlConfig.failedToolAttemptsBeforeAttention)) {
-						emitNeedsAttention(now, {
-							message: `${agent.name} needs attention after repeated mutating tool failures`,
-							reason: "tool_failures",
-							currentTool: toolSnapshot.tool,
-							currentPath: toolSnapshot.path,
-							currentToolDurationMs: toolSnapshot.startedAt ? Math.max(0, now - toolSnapshot.startedAt) : undefined,
-							recentFailureSummary: summarizeRecentMutatingFailures(mutatingFailures),
-						});
+				// Pi delivers every tool result, including a call blocked by a tool_call handler, as a
+				// toolResult message after tool_execution_end; it emits no separate result event.
+				if (evt.message.role === "toolResult") {
+					const resultText = extractTextFromContent(evt.message.content);
+					// The result message's own tool name is authoritative; the single pending slot can
+					// describe a different, overlapping call and serves only as a fallback.
+					const resultToolName = (evt.message as { toolName?: unknown }).toolName;
+					const blockedTool = (typeof resultToolName === "string" && resultToolName.length > 0 ? resultToolName : undefined) ?? pendingToolResult?.tool;
+					if (options.toolBudget && isToolBudgetBlockedMessage(options.toolBudget, resultText, blockedTool)) {
+						result.toolBudgetBlocked = true;
+						result.toolBudget = toolBudgetState(
+							options.toolBudget,
+							Math.max(progress.toolCount, options.toolBudget.hard + 1),
+							blockedTool,
+						);
 					}
-				} else if (toolSnapshot?.mutates) {
-					resetMutatingFailureState(mutatingFailures);
+					appendRecentOutput(progress, resultText.split("\n").slice(-10));
+					const toolSnapshot = pendingToolResult;
+					pendingToolResult = undefined;
+					if (toolSnapshot?.mutates && didMutatingToolFail(resultText)) {
+						recordMutatingFailure(mutatingFailures, {
+							tool: toolSnapshot.tool,
+							path: toolSnapshot.path,
+							error: resultText.split("\n").find((line) => line.trim())?.trim().slice(0, 180) ?? "mutating tool failed",
+							ts: now,
+						}, mutatingFailureWindowMs);
+						if (shouldEscalateMutatingFailures(mutatingFailures, controlConfig.failedToolAttemptsBeforeAttention)) {
+							emitNeedsAttention(now, {
+								message: `${agent.name} needs attention after repeated mutating tool failures`,
+								reason: "tool_failures",
+								currentTool: toolSnapshot.tool,
+								currentPath: toolSnapshot.path,
+								currentToolDurationMs: toolSnapshot.startedAt ? Math.max(0, now - toolSnapshot.startedAt) : undefined,
+								recentFailureSummary: summarizeRecentMutatingFailures(mutatingFailures),
+							});
+						}
+					} else if (toolSnapshot?.mutates) {
+						resetMutatingFailureState(mutatingFailures);
+					}
 				}
+				updateActivityState(now);
 				fireUpdate();
 			}
 		};

@@ -3120,14 +3120,17 @@ export async function runSubagent(
 				syncAggregateActivityState();
 			}
 			syncTopLevelCurrentTool();
-		} else if (event.type === "tool_result_end" && event.message) {
+		} else if (event.type === "message_end" && event.message?.role === "toolResult") {
+			// Pi delivers every tool result, including a blocked call, as a toolResult message after tool_execution_end.
 			const toolSnapshot = pendingToolResults[flatIndex];
 			pendingToolResults[flatIndex] = undefined;
 			const resultText = extractTextFromContent(event.message.content);
-			if (toolSnapshot && resultText.includes("Tool budget hard limit reached")) {
+			const resultToolName = (event.message as { toolName?: unknown }).toolName;
+			const blockedTool = (typeof resultToolName === "string" && resultToolName.length > 0 ? resultToolName : undefined) ?? toolSnapshot?.tool;
+			if (blockedTool && resultText.includes("Tool budget hard limit reached")) {
 				const configuredToolBudget = flatSteps[flatIndex]?.toolBudget;
 				if (configuredToolBudget) {
-					step.toolBudget = toolBudgetState(configuredToolBudget, step.toolCount ?? 0, toolSnapshot.tool);
+					step.toolBudget = toolBudgetState(configuredToolBudget, step.toolCount ?? 0, blockedTool);
 					step.toolBudgetBlocked = true;
 					statusPayload.toolBudget = step.toolBudget;
 					statusPayload.toolBudgetBlocked = true;
