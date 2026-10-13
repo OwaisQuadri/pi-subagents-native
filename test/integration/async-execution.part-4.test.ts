@@ -1626,6 +1626,59 @@ setTimeout(() => process.exit(90), 15000).unref();
 		}
 	});
 
+	it("background runs record a parallel batch's mutating failure against the failed call's path", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		// Pi's parallel tool execution: every start and end comes before the result messages.
+		const result = (toolCallId: string, isError: boolean, text: string) => ({ type: "message_end", message: { role: "toolResult", toolCallId, toolName: "edit", isError, content: [{ type: "text", text }] } });
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [
+					{ type: "tool_execution_start", toolCallId: "edit-a", toolName: "edit", args: { path: "src/a.ts" } },
+					{ type: "tool_execution_start", toolCallId: "edit-b", toolName: "edit", args: { path: "src/b.ts" } },
+					{ type: "tool_execution_end", toolCallId: "edit-a", toolName: "edit", isError: true },
+					{ type: "tool_execution_end", toolCallId: "edit-b", toolName: "edit", isError: false },
+					result("edit-a", true, "No exact match found for a.ts"),
+					result("edit-b", false, "Edited src/b.ts"),
+				] },
+				{ jsonl: [events.assistantMessage("Edit A failed.")] },
+			],
+		});
+
+		const id = `async-parallel-failure-${Date.now().toString(36)}`;
+		const eventsPath = path.join(ASYNC_DIR, id, "events.jsonl");
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Edit both files",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			controlConfig: {
+				enabled: true,
+				needsAttentionAfterMs: 999_999,
+				activeNoticeAfterTurns: 999_999,
+				activeNoticeAfterMs: 999_999,
+				activeNoticeAfterTokens: 999_999,
+				failedToolAttemptsBeforeAttention: 1,
+				notifyOn: ["active_long_running", "needs_attention"],
+				notifyChannels: ["event", "async", "intercom"],
+			},
+		});
+
+		const deadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > deadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		const failureEvent = fs.readFileSync(eventsPath, "utf-8").split("\n").filter(Boolean)
+			.map((line) => (JSON.parse(line) as { event?: { reason?: string; currentPath?: string; recentFailureSummary?: string } }).event)
+			.find((event) => event?.reason === "tool_failures");
+		assert.equal(failureEvent?.currentPath, "src/a.ts");
+		assert.equal(failureEvent?.recentFailureSummary, "edit(src/a.ts): No exact match found for a.ts");
+	});
+
 	it("background status shows a tool-budget block from Pi's tool result message while the run is active", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const blockedMessage = "Tool budget hard limit reached after 2 tool calls (hard 1). The 'bash' tool is blocked so you can finalize from the context you already have.";
 		const blockedResult = { role: "toolResult", toolCallId: "bash-2", toolName: "bash", isError: true, content: [{ type: "text", text: blockedMessage }] };

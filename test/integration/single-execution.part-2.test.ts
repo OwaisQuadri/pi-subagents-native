@@ -2644,6 +2644,33 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(result.messages?.filter((message) => message.role === "toolResult").length, 3, "each tool result is recorded once");
 	});
 
+	it("records a parallel batch's mutating failure against the failed call's path", async () => {
+		// Pi's parallel tool execution: every start and end comes before the result messages.
+		const result = (toolCallId: string, isError: boolean, text: string) => ({ type: "message_end", message: { role: "toolResult", toolCallId, toolName: "edit", isError, content: [{ type: "text", text }] } });
+		mockPi.onCall({
+			jsonl: [
+				{ type: "tool_execution_start", toolCallId: "edit-a", toolName: "edit", args: { path: "src/a.ts" } },
+				{ type: "tool_execution_start", toolCallId: "edit-b", toolName: "edit", args: { path: "src/b.ts" } },
+				{ type: "tool_execution_end", toolCallId: "edit-a", toolName: "edit", isError: true },
+				{ type: "tool_execution_end", toolCallId: "edit-b", toolName: "edit", isError: false },
+				result("edit-a", true, "No exact match found for a.ts"),
+				result("edit-b", false, "Edited src/b.ts"),
+				events.assistantMessage("Edit A failed."),
+			],
+		});
+		const controlEvents: NonNullable<RunSyncResult["controlEvents"]> = [];
+
+		await runSync(tempDir, [makeAgent("worker")], "worker", "Edit both files", {
+			runId: "run-parallel-failure",
+			controlConfig: { enabled: true, failedToolAttemptsBeforeAttention: 1, notifyOn: ["active_long_running", "needs_attention"] },
+			onControlEvent: (event: NonNullable<RunSyncResult["controlEvents"]>[number]) => controlEvents.push(event),
+		});
+
+		const failureEvent = controlEvents.find((event) => event.reason === "tool_failures");
+		assert.equal(failureEvent?.currentPath, "src/a.ts");
+		assert.equal(failureEvent?.recentFailureSummary, "edit(src/a.ts): No exact match found for a.ts");
+	});
+
 	it("does not surface control state or events when control is disabled", async () => {
 		mockPi.onCall({
 			jsonl: [

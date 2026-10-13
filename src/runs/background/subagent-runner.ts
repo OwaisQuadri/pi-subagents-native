@@ -2644,7 +2644,11 @@ export async function runSubagent(
 	const emittedControlEventKeys = new Set<string>();
 	const activeLongRunningSteps = new Set<number>();
 	const mutatingFailureStates = initialStatusSteps.map(() => createMutatingFailureState());
-	const pendingToolResults: Array<{ tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined> = initialStatusSteps.map(() => undefined);
+	type PendingToolResult = { tool: string; path?: string; mutates: boolean; startedAt?: number };
+	const pendingToolResults: Array<PendingToolResult | undefined> = initialStatusSteps.map(() => undefined);
+	// Pi's parallel tool execution emits every tool_execution_start before the first result message, so each
+	// step matches results to calls by toolCallId; pendingToolResults keeps the last-started call for events without one.
+	const pendingToolResultsByCallId = initialStatusSteps.map(() => new Map<string, PendingToolResult>());
 	type ActiveToolCall = { attentionEmitted?: boolean; key: string; tool: string; args: string; startedAt: number; path?: string; blocksSupervisor: boolean };
 	const activeToolCalls = initialStatusSteps.map(() => new Map<string, ActiveToolCall>());
 	const activeToolKeysByName = initialStatusSteps.map(() => new Map<string, string[]>());
@@ -3077,7 +3081,10 @@ export async function runSubagent(
 				statusPayload.toolBudget = step.toolBudget;
 			}
 			recordActiveToolCall(flatIndex, { toolCallId: (event as { toolCallId?: unknown }).toolCallId, toolName: event.toolName }, { argsPreview, currentPath, blocksSupervisor, now });
-			pendingToolResults[flatIndex] = omitUndefinedProperties({ tool: event.toolName, path: currentPath, mutates, startedAt: now });
+			const pending: PendingToolResult = omitUndefinedProperties({ tool: event.toolName, path: currentPath, mutates, startedAt: now });
+			pendingToolResults[flatIndex] = pending;
+			const startedCallId = (event as { toolCallId?: unknown }).toolCallId;
+			if (typeof startedCallId === "string" && startedCallId) pendingToolResultsByCallId[flatIndex]!.set(startedCallId, pending);
 			statusPayload.toolCount = (statusPayload.toolCount ?? 0) + 1;
 			syncTopLevelCurrentTool();
 			if (controlConfig.enabled && blocksSupervisor && step.activityState !== "needs_attention") {
@@ -3122,8 +3129,12 @@ export async function runSubagent(
 			syncTopLevelCurrentTool();
 		} else if (event.type === "message_end" && event.message?.role === "toolResult") {
 			// Pi delivers every tool result, including a blocked call, as a toolResult message after tool_execution_end.
-			const toolSnapshot = pendingToolResults[flatIndex];
-			pendingToolResults[flatIndex] = undefined;
+			const resultCallId = (event.message as { toolCallId?: unknown }).toolCallId;
+			const byCallId = pendingToolResultsByCallId[flatIndex]!;
+			const keyedSnapshot = typeof resultCallId === "string" ? byCallId.get(resultCallId) : undefined;
+			if (keyedSnapshot) byCallId.delete(resultCallId as string);
+			const toolSnapshot = keyedSnapshot ?? pendingToolResults[flatIndex];
+			if (!keyedSnapshot || pendingToolResults[flatIndex] === keyedSnapshot) pendingToolResults[flatIndex] = undefined;
 			const resultText = extractTextFromContent(event.message.content);
 			const resultToolName = (event.message as { toolName?: unknown }).toolName;
 			const blockedTool = (typeof resultToolName === "string" && resultToolName.length > 0 ? resultToolName : undefined) ?? toolSnapshot?.tool;

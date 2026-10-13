@@ -794,7 +794,11 @@ async function runSingleAttempt(
 		};
 
 		let activeLongRunningNotified = false;
-		let pendingToolResult: { tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined;
+		type PendingToolResult = { tool: string; path?: string; mutates: boolean; startedAt?: number };
+		// Pi's parallel tool execution emits every tool_execution_start before the first result message,
+		// so results are matched to their call by toolCallId; the last-started slot covers events without one.
+		const pendingToolResultsByCallId = new Map<string, PendingToolResult>();
+		let pendingToolResult: PendingToolResult | undefined;
 		type ActiveToolCall = { attentionEmitted?: boolean; key: string; tool: string; args: string; startedAt: number; path?: string };
 		let activeToolSequence = 0;
 		const activeToolCalls = new Map<string, ActiveToolCall>();
@@ -1063,6 +1067,7 @@ async function runSingleAttempt(
 				}
 				const mutates = isMutatingTool(evt.toolName, toolArgs, agent.mutationTools);
 				pendingToolResult = { tool: evt.toolName ?? "tool", path: activeTool?.path, mutates, startedAt: now };
+				if (typeof evt.toolCallId === "string" && evt.toolCallId) pendingToolResultsByCallId.set(evt.toolCallId, pendingToolResult);
 				fireUpdate();
 			}
 
@@ -1142,10 +1147,14 @@ async function runSingleAttempt(
 				// toolResult message after tool_execution_end; it emits no separate result event.
 				if (evt.message.role === "toolResult") {
 					const resultText = extractTextFromContent(evt.message.content);
-					// The result message's own tool name is authoritative; the single pending slot can
-					// describe a different, overlapping call and serves only as a fallback.
+					const resultCallId = (evt.message as { toolCallId?: unknown }).toolCallId;
+					const keyedSnapshot = typeof resultCallId === "string" ? pendingToolResultsByCallId.get(resultCallId) : undefined;
+					if (keyedSnapshot) pendingToolResultsByCallId.delete(resultCallId as string);
+					const toolSnapshot = keyedSnapshot ?? pendingToolResult;
+					if (!keyedSnapshot || pendingToolResult === keyedSnapshot) pendingToolResult = undefined;
+					// The result message's own tool name is authoritative; the pending snapshot is only a fallback.
 					const resultToolName = (evt.message as { toolName?: unknown }).toolName;
-					const blockedTool = (typeof resultToolName === "string" && resultToolName.length > 0 ? resultToolName : undefined) ?? pendingToolResult?.tool;
+					const blockedTool = (typeof resultToolName === "string" && resultToolName.length > 0 ? resultToolName : undefined) ?? toolSnapshot?.tool;
 					if (options.toolBudget && isToolBudgetBlockedMessage(options.toolBudget, resultText, blockedTool)) {
 						result.toolBudgetBlocked = true;
 						result.toolBudget = toolBudgetState(
@@ -1155,8 +1164,6 @@ async function runSingleAttempt(
 						);
 					}
 					appendRecentOutput(progress, resultText.split("\n").slice(-10));
-					const toolSnapshot = pendingToolResult;
-					pendingToolResult = undefined;
 					if (toolSnapshot?.mutates && didMutatingToolFail(resultText)) {
 						recordMutatingFailure(mutatingFailures, {
 							tool: toolSnapshot.tool,
